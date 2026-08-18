@@ -52,6 +52,7 @@ user_client = TelegramClient(
 class PostFlow(StatesGroup):
     waiting_text = State()
     waiting_schedule_choice = State()
+    waiting_repeat_choice = State()
 
 
 def db():
@@ -74,6 +75,17 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS repeating_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                interval_minutes INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
 
 
 def is_admin(message_or_query) -> bool:
@@ -93,7 +105,10 @@ def main_menu():
                 KeyboardButton(text="🗑 Delete Post"),
             ],
             [
+                KeyboardButton(text="🔄 Repeating Posts"),
                 KeyboardButton(text="👁 Preview Formatter"),
+            ],
+            [
                 KeyboardButton(text="ℹ️ Help"),
             ],
         ],
@@ -212,12 +227,49 @@ def confirm_post_keyboard():
             ],
             [
                 InlineKeyboardButton(
+                    text="🔁 Repeat",
+                    callback_data="choose_repeat",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
                     text="❌ Cancel",
                     callback_data="cancel",
                 )
             ],
         ]
     )
+
+
+REPEAT_INTERVALS = [
+    (30, "30 min"),
+    (60, "1 hour"),
+    (120, "2 hours"),
+    (180, "3 hours"),
+    (360, "6 hours"),
+    (720, "12 hours"),
+    (1440, "24 hours"),
+]
+
+
+def repeat_interval_keyboard():
+    buttons = []
+    for i in range(0, len(REPEAT_INTERVALS), 2):
+        row = []
+        for minutes, label in REPEAT_INTERVALS[i:i+2]:
+            row.append(
+                InlineKeyboardButton(
+                    text=f"🔁 {label}",
+                    callback_data=f"repeat:{minutes}",
+                )
+            )
+        buttons.append(row)
+
+    buttons.append([
+        InlineKeyboardButton(text="❌ Cancel", callback_data="cancel")
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 async def send_scheduled_post(post_id: int):
@@ -279,6 +331,52 @@ def load_jobs():
             args=[row["id"]],
             id=f"post_{row['id']}",
             replace_existing=True,
+        )
+
+
+async def send_repeating_post(repeat_id: int):
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT id, text, active
+            FROM repeating_posts
+            WHERE id = ?
+            """,
+            (repeat_id,),
+        ).fetchone()
+
+    if not row or not row["active"]:
+        return
+
+    try:
+        await publish_as_personal_account(row["text"])
+        logger.info("Sent repeating post %s", repeat_id)
+    except Exception:
+        logger.exception("Failed to send repeating post %s", repeat_id)
+
+
+def load_repeating_jobs():
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, interval_minutes
+            FROM repeating_posts
+            WHERE active = 1
+            """
+        ).fetchall()
+
+    tz = ZoneInfo(TIMEZONE)
+    now = datetime.now(tz)
+
+    for row in rows:
+        scheduler.add_job(
+            send_repeating_post,
+            "interval",
+            minutes=row["interval_minutes"],
+            args=[row["id"]],
+            id=f"repeat_{row['id']}",
+            replace_existing=True,
+            next_run_time=now,
         )
 
 
@@ -478,6 +576,142 @@ async def save_schedule(query: CallbackQuery, state: FSMContext):
     await query.answer()
 
 
+@router.callback_query(F.data == "choose_repeat")
+async def choose_repeat(query: CallbackQuery):
+    if not is_admin(query):
+        return
+
+    await query.message.answer(
+        "🔁 Choose how often this post should repeat:",
+        reply_markup=repeat_interval_keyboard(),
+    )
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("repeat:"))
+async def save_repeat(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query):
+        return
+
+    data = await state.get_data()
+    text = data.get("post_text")
+
+    if not text:
+        await query.answer("Post expired. Start again.", show_alert=True)
+        return
+
+    minutes = int(query.data.split("repeat:", 1)[1])
+    tz = ZoneInfo(TIMEZONE)
+    now = datetime.now(tz)
+
+    with db() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO repeating_posts (text, interval_minutes, active, created_at)
+            VALUES (?, ?, 1, ?)
+            """,
+            (text, minutes, now.isoformat()),
+        )
+        repeat_id = cursor.lastrowid
+
+    scheduler.add_job(
+        send_repeating_post,
+        "interval",
+        minutes=minutes,
+        args=[repeat_id],
+        id=f"repeat_{repeat_id}",
+        replace_existing=True,
+        next_run_time=now,
+    )
+
+    await state.clear()
+
+    try:
+        await query.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    label = next((lbl for m, lbl in REPEAT_INTERVALS if m == minutes), f"{minutes} min")
+    await query.message.answer(
+        f"✅ Repeating post #{repeat_id} created — publishing now, then every {label}.\n\n"
+        "Use 🔄 Repeating Posts to stop it later.",
+        reply_markup=main_menu(),
+    )
+    await query.answer()
+
+
+@router.message(F.text == "🔄 Repeating Posts")
+async def repeating_posts_menu(message: Message):
+    if not is_admin(message):
+        return
+
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, text, interval_minutes
+            FROM repeating_posts
+            WHERE active = 1
+            ORDER BY id
+            LIMIT 20
+            """
+        ).fetchall()
+
+    if not rows:
+        await message.answer("📭 There are no active repeating posts.")
+        return
+
+    keyboard = []
+    lines = ["🔄 Active Repeating Posts\n"]
+
+    for row in rows:
+        label = next(
+            (lbl for m, lbl in REPEAT_INTERVALS if m == row["interval_minutes"]),
+            f"{row['interval_minutes']} min",
+        )
+        preview = row["text"].replace("\n", " ")
+        if len(preview) > 50:
+            preview = preview[:47] + "..."
+
+        lines.append(f"#{row['id']} • every {label}\n{preview}")
+
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"⛔ Stop #{row['id']}",
+                callback_data=f"stop_repeat:{row['id']}",
+            )
+        ])
+
+    await message.answer(
+        "\n\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+    )
+
+
+@router.callback_query(F.data.startswith("stop_repeat:"))
+async def stop_repeat(query: CallbackQuery):
+    if not is_admin(query):
+        return
+
+    repeat_id = int(query.data.split(":", 1)[1])
+
+    with db() as conn:
+        cursor = conn.execute(
+            "UPDATE repeating_posts SET active = 0 WHERE id = ? AND active = 1",
+            (repeat_id,),
+        )
+
+    if cursor.rowcount:
+        job = scheduler.get_job(f"repeat_{repeat_id}")
+        if job:
+            job.remove()
+
+        await query.message.edit_text(f"⛔ Repeating post #{repeat_id} stopped.")
+    else:
+        await query.message.edit_text("❌ Repeating post not found or already stopped.")
+
+    await query.answer()
+
+
 @router.message(F.text == "📅 Scheduled Posts")
 async def scheduled_posts(message: Message):
     if not is_admin(message):
@@ -612,10 +846,11 @@ async def help_menu(message: Message):
 
     await message.answer(
         "🤖 Personal Account Publisher\n\n"
-        "📝 New Post — format, preview, publish or schedule.\n"
+        "📝 New Post — format, preview, publish, schedule, or repeat.\n"
         "⚡ Quick Publish — publish immediately.\n"
-        "📅 Scheduled Posts — view pending posts.\n"
-        "🗑 Delete Post — delete pending posts.\n"
+        "📅 Scheduled Posts — view pending one-time posts.\n"
+        "🗑 Delete Post — delete pending one-time posts.\n"
+        "🔄 Repeating Posts — view/stop posts that repeat on an interval.\n"
         "👁 Preview Formatter — test formatting.\n\n"
         "Posts are sent by your personal Telegram account through MTProto."
     )
@@ -639,7 +874,21 @@ async def main():
         me.id,
     )
 
+    # Preload every chat this account is a member of so that Telethon
+    # caches the access_hash for each one. Without this, TARGET_CHAT
+    # set to a raw numeric ID (e.g. -1001234567890) fails with:
+    #   ValueError: Cannot find any entity corresponding to "..."
+    # because StringSession doesn't persist entity access_hashes across
+    # restarts. Usernames/invite links don't need this, but it's kept
+    # here so numeric IDs work too.
+    try:
+        dialogs = await user_client.get_dialogs()
+        logger.info("Preloaded %d chats for entity resolution.", len(dialogs))
+    except Exception:
+        logger.exception("Failed to preload dialogs (entity cache).")
+
     load_jobs()
+    load_repeating_jobs()
     scheduler.start()
 
     logger.info("Control bot started. Timezone: %s", TIMEZONE)
