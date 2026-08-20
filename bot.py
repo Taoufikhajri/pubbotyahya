@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -123,6 +124,7 @@ def init_db():
         _ensure_column(conn, "scheduled_posts", "chat_ref", "TEXT")
         _ensure_column(conn, "repeating_posts", "chat_ref", "TEXT")
         _ensure_column(conn, "repeating_posts", "paused", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "repeating_posts", "target_refs", "TEXT")
 
 
 def is_admin(message_or_query) -> bool:
@@ -153,6 +155,25 @@ def group_label(chat_ref) -> str:
     if row and row["title"]:
         return row["title"]
     return chat_ref
+
+
+def repeat_target_label(chat_ref, target_refs_json) -> str:
+    """Display label for a repeating post's target(s) — a single group
+    (chat_ref) or several groups stored as a JSON list in target_refs."""
+    if target_refs_json:
+        try:
+            refs = json.loads(target_refs_json)
+        except (TypeError, ValueError):
+            refs = []
+
+        if refs:
+            labels = [group_label(r) for r in refs]
+            if len(labels) > 3:
+                shown = ", ".join(labels[:3])
+                return f"{len(labels)} groups: {shown}, ..."
+            return f"{len(labels)} group(s): " + ", ".join(labels)
+
+    return group_label(chat_ref)
 
 
 def main_menu():
@@ -335,7 +356,7 @@ REPEAT_INTERVALS = [
 ]
 
 
-def repeat_interval_keyboard():
+def interval_keyboard(callback_prefix: str):
     buttons = []
     for i in range(0, len(REPEAT_INTERVALS), 2):
         row = []
@@ -343,7 +364,7 @@ def repeat_interval_keyboard():
             row.append(
                 InlineKeyboardButton(
                     text=f"🔁 {label}",
-                    callback_data=f"repeat:{minutes}",
+                    callback_data=f"{callback_prefix}:{minutes}",
                 )
             )
         buttons.append(row)
@@ -353,6 +374,10 @@ def repeat_interval_keyboard():
     ])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def repeat_interval_keyboard():
+    return interval_keyboard("repeat")
 
 
 def multi_group_keyboard(groups, selected_ids):
@@ -377,6 +402,9 @@ def multi_group_keyboard(groups, selected_ids):
 
     keyboard.append([
         InlineKeyboardButton(text="🚀 Publish to Selected", callback_data="multi_publish")
+    ])
+    keyboard.append([
+        InlineKeyboardButton(text="🔁 Repeat on Selected", callback_data="choose_multi_repeat")
     ])
     keyboard.append([
         InlineKeyboardButton(text="❌ Cancel", callback_data="cancel")
@@ -451,7 +479,7 @@ async def send_repeating_post(repeat_id: int):
     with db() as conn:
         row = conn.execute(
             """
-            SELECT id, text, active, paused, chat_ref
+            SELECT id, text, active, paused, chat_ref, target_refs
             FROM repeating_posts
             WHERE id = ?
             """,
@@ -461,11 +489,44 @@ async def send_repeating_post(repeat_id: int):
     if not row or not row["active"] or row["paused"]:
         return
 
-    try:
-        await publish_as_personal_account(row["text"], chat_ref=row["chat_ref"])
-        logger.info("Sent repeating post %s", repeat_id)
-    except Exception:
-        logger.exception("Failed to send repeating post %s", repeat_id)
+    targets = []
+    if row["target_refs"]:
+        try:
+            targets = json.loads(row["target_refs"]) or []
+        except (TypeError, ValueError):
+            targets = []
+
+    if targets:
+        # Multi-group repeat: send to every saved target, one at a time.
+        failures = []
+        for ref in targets:
+            try:
+                await publish_as_personal_account(row["text"], chat_ref=ref)
+            except Exception as exc:
+                logger.exception("Failed to send repeating post %s to %s", repeat_id, ref)
+                failures.append(f"{group_label(ref)}: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(3)
+
+        logger.info(
+            "Repeating post %s sent to %d/%d group(s)",
+            repeat_id, len(targets) - len(failures), len(targets),
+        )
+
+        if failures:
+            try:
+                await bot.send_message(
+                    ADMIN_USER_ID,
+                    f"⚠️ Repeating post #{repeat_id} failed for:\n" + "\n".join(failures),
+                )
+            except Exception:
+                logger.exception("Failed to notify admin about repeat failures")
+    else:
+        # Single-group repeat (original behaviour).
+        try:
+            await publish_as_personal_account(row["text"], chat_ref=row["chat_ref"])
+            logger.info("Sent repeating post %s", repeat_id)
+        except Exception:
+            logger.exception("Failed to send repeating post %s", repeat_id)
 
 
 def load_repeating_jobs():
@@ -765,7 +826,7 @@ async def repeating_posts_menu(message: Message):
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT id, text, interval_minutes, paused, chat_ref
+            SELECT id, text, interval_minutes, paused, chat_ref, target_refs
             FROM repeating_posts
             WHERE active = 1
             ORDER BY id
@@ -790,8 +851,9 @@ async def repeating_posts_menu(message: Message):
             preview = preview[:47] + "..."
 
         status = "⏸ Paused" if row["paused"] else "▶ Running"
+        target = repeat_target_label(row["chat_ref"], row["target_refs"])
         lines.append(
-            f"#{row['id']} • every {label} • {status} • {group_label(row['chat_ref'])}\n{preview}"
+            f"#{row['id']} • every {label} • {status} • {target}\n{preview}"
         )
 
         toggle_btn = (
@@ -1199,6 +1261,94 @@ async def multi_publish(query: CallbackQuery, state: FSMContext):
         "📣 Multi-group publish results:\n\n" + "\n".join(results),
         reply_markup=main_menu(),
     )
+
+
+@router.callback_query(F.data == "choose_multi_repeat")
+async def choose_multi_repeat(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query):
+        return
+
+    data = await state.get_data()
+    selected_ids = data.get("multi_selected", [])
+
+    if not selected_ids:
+        await query.answer("Select at least one group first.", show_alert=True)
+        return
+
+    await query.message.answer(
+        f"🔁 Choose how often this post should repeat across your {len(selected_ids)} selected group(s):",
+        reply_markup=interval_keyboard("multi_repeat"),
+    )
+    await query.answer()
+
+
+@router.callback_query(F.data.startswith("multi_repeat:"))
+async def save_multi_repeat(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query):
+        return
+
+    data = await state.get_data()
+    text = data.get("multi_text")
+    selected_ids = data.get("multi_selected", [])
+
+    if not text or not selected_ids:
+        await query.answer("Post expired or no groups selected. Start again.", show_alert=True)
+        return
+
+    minutes = int(query.data.split("multi_repeat:", 1)[1])
+
+    placeholders = ",".join("?" for _ in selected_ids)
+    with db() as conn:
+        groups = conn.execute(
+            f"SELECT id, chat_ref, title FROM groups WHERE id IN ({placeholders})",
+            selected_ids,
+        ).fetchall()
+
+    if not groups:
+        await query.answer("Selected groups no longer exist.", show_alert=True)
+        return
+
+    target_refs = [g["chat_ref"] for g in groups]
+    tz = ZoneInfo(TIMEZONE)
+    now = datetime.now(tz)
+
+    with db() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO repeating_posts
+                (text, interval_minutes, active, paused, created_at, chat_ref, target_refs)
+            VALUES (?, ?, 1, 0, ?, NULL, ?)
+            """,
+            (text, minutes, now.isoformat(), json.dumps(target_refs)),
+        )
+        repeat_id = cursor.lastrowid
+
+    scheduler.add_job(
+        send_repeating_post,
+        "interval",
+        minutes=minutes,
+        args=[repeat_id],
+        id=f"repeat_{repeat_id}",
+        replace_existing=True,
+        next_run_time=now,
+    )
+
+    await state.clear()
+
+    try:
+        await query.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    label = next((lbl for m, lbl in REPEAT_INTERVALS if m == minutes), f"{minutes} min")
+    names = ", ".join(g["title"] or g["chat_ref"] for g in groups)
+    await query.message.answer(
+        f"✅ Repeating post #{repeat_id} created — publishing now, then every {label} "
+        f"to {len(groups)} group(s): {names}.\n\n"
+        "Use 🔄 Repeating Posts to pause, resume, or delete it later.",
+        reply_markup=main_menu(),
+    )
+    await query.answer()
 
 
 @router.message(F.text == "📅 Scheduled Posts")
