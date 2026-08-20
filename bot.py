@@ -356,7 +356,15 @@ def repeat_interval_keyboard():
 
 
 def multi_group_keyboard(groups, selected_ids):
-    keyboard = []
+    all_selected = bool(groups) and len(selected_ids) == len(groups)
+
+    keyboard = [[
+        InlineKeyboardButton(
+            text="⬜ Deselect All" if all_selected else "☑️ Select All",
+            callback_data="toggle_all_groups",
+        )
+    ]]
+
     for g in groups:
         mark = "✅" if g["id"] in selected_ids else "▫️"
         label = g["title"] or g["chat_ref"]
@@ -1084,6 +1092,35 @@ async def multi_post_receive_text(message: Message, state: FSMContext):
         "✨ Formatted post:\n\n" + formatted + "\n\nSelect the groups to publish to:",
         reply_markup=multi_group_keyboard(groups, []),
     )
+
+
+@router.callback_query(F.data == "toggle_all_groups")
+async def toggle_all_groups(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query):
+        return
+
+    with db() as conn:
+        groups = conn.execute(
+            "SELECT id, chat_ref, title FROM groups ORDER BY id"
+        ).fetchall()
+
+    data = await state.get_data()
+    selected = set(data.get("multi_selected", []))
+    all_ids = {g["id"] for g in groups}
+
+    # If everything is already selected, clear it; otherwise select all.
+    selected = set() if selected == all_ids else all_ids
+
+    await state.update_data(multi_selected=list(selected))
+
+    try:
+        await query.message.edit_reply_markup(
+            reply_markup=multi_group_keyboard(groups, selected)
+        )
+    except Exception:
+        pass
+
+    await query.answer()
 
 
 @router.callback_query(F.data.startswith("toggle_group:"))
